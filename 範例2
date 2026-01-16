@@ -1,0 +1,457 @@
+# PostAction 事件後續處理功能實作計畫書
+
+## 📋 功能概述
+
+根據 Azure DevOps Task 63079，需要在公告系統的 CRUD 操作中增加使用者動作選項功能。使用者可以選擇是否執行特定動作（目前為郵件發送），這些選擇會附加到事件訊息中，讓 consumer 自行決定後續處理行為。
+
+### 核心需求
+- 在建立、更新內容、更新檔案、刪除公告的 API 中新增可選的 `postActions` 陣列欄位
+- 目前只支援 `Mail` 動作類型，但設計需具有擴展性
+- 最小修改範圍，重用現有 CQRS 架構
+- 加入驗證機制確保傳入值在 enum 定義範圍內
+
+## 🔍 現有程式碼分析
+
+### CQRS 架構現況
+系統採用清晰的 CQRS 分離設計：
+
+**Command 層**：
+- `CreateAnnouncementBoardCommand` - 建立公告命令
+- `UpdateAnnouncementBoardContentCommand` - 更新內容命令  
+- `UpdateAnnouncementBoardFilesCommand` - 更新檔案命令
+- `DeleteAnnouncementBoardCommand` - 刪除公告命令
+
+**CommandService 層**：
+- 各自對應的 `*CommandService` 類別處理業務邏輯
+- 統一使用 `IEventPublisher` 發布事件
+
+**Event 層**：
+- `AnnouncementCreatedEvent` - 公告建立事件
+- `AnnouncementContentUpdatedEvent` - 內容更新事件  
+- `AnnouncementFilesUpdatedEvent` - 檔案更新事件
+- `AnnouncementDeletedEvent` - 公告刪除事件
+
+**Controller 層**：
+- `AnnouncementBoardController` 使用 `ICommandService<TCommand>` 注入
+- ViewModel 驗證透過 `IValidatableObject` 實現
+
+### 可重用資源
+- 現有的事件發布機制完整可用
+- Record 類別結構支援新增欄位的修改
+- Controller 到 Command 的映射模式已建立
+
+## 📊 影響範圍評估
+
+### 需要修改的檔案
+1. **Announcement.Core 專案**（5 個檔案）
+   - 新增 `PostActionType.cs` enum 定義
+   - 修改 4 個 Command record 類別
+   - 修改 4 個 Event record 類別
+
+2. **Announcement.Web 專案**（5 個檔案）
+   - 新增 `PostActionTypeValidationAttribute.cs` 驗證屬性
+   - 新增 `DeleteAnnouncementBoardQueryViewModel.cs` 查詢 ViewModel
+   - 修改 3 個現有 ViewModel 類別
+   - 修改 `AnnouncementBoardController.cs` 的 4 個 Action 方法
+
+3. **測試專案**（2 個檔案）
+   - 新增 `PostActionTypeValidationAttributeTests.cs` 驗證屬性測試
+   - 更新相關單元測試程式碼，確保新欄位的測試覆蓋率
+
+### 副作用評估
+- **向前相容性**：新增欄位使用預設值，不影響現有 API 呼叫
+- **資料庫無變更**：純 API 層面功能，不涉及資料結構修改
+- **效能影響**：微小，僅增加陣列欄位序列化/反序列化成本
+
+## 💡 解決方案設計
+
+### 技術架構
+```
+API Request (PostActions[]) 
+  ↓ ViewModel 驗證
+  ↓ Command 物件建立  
+  ↓ CommandService 業務處理
+  ↓ Event 發布 (含 PostActions)
+  ↓ Consumer 根據 PostActions 決定行為
+```
+
+### 設計原則
+1. **最小修改**：在現有 record 類別基礎上新增欄位
+2. **型別安全**：使用 enum 確保動作類型的正確性
+3. **預設安全**：PostActions 預設為空陣列，保持向前相容
+4. **擴展友善**：enum 設計支援未來新增其他動作類型
+
+## 🛠️ 詳細實作指引
+
+### 階段 1：定義核心類型與驗證機制
+
+#### 1.1 建立 PostActionType Enum
+**檔案**：`Announcement.Core/PostActionType.cs`
+
+```csharp
+namespace Announcement.Core;
+
+/// <summary>
+/// 事件後續處理動作類型
+/// </summary>
+public enum PostActionType
+{
+    /// <summary>
+    /// 發送郵件通知
+    /// </summary>
+    Mail = 1
+}
+```
+
+#### 1.2 建立共用驗證屬性
+**檔案**：`Announcement.Web/Validations/PostActionTypeValidationAttribute.cs`
+
+```csharp
+using System.ComponentModel.DataAnnotations;
+using Announcement.Core;
+
+namespace Announcement.Web.Validations;
+
+/// <summary>
+/// PostActionType 陣列驗證屬性
+/// </summary>
+public class PostActionTypeValidationAttribute : ValidationAttribute
+{
+    // 使用靜態 HashSet 快取有效值，避免 Enum.IsDefined 的反射開銷
+    private static readonly HashSet<PostActionType> ValidActions = new(
+        Enum.GetValues<PostActionType>());
+
+    public PostActionTypeValidationAttribute()
+    {
+        ErrorMessage = "不支援的動作類型: {0}";
+    }
+
+    protected override ValidationResult? IsValid(object? value, ValidationContext validationContext)
+    {
+        if (value is null)
+            return ValidationResult.Success;
+
+        if (value is PostActionType[] actions)
+        {
+            foreach (var action in actions)
+            {
+                if (!ValidActions.Contains(action))
+                {
+                    return new ValidationResult(
+                        string.Format(ErrorMessage!, action),
+                        new[] { validationContext.MemberName ?? "PostActions" });
+                }
+            }
+        }
+
+        return ValidationResult.Success;
+    }
+}
+```
+
+**效能優化重點**：
+- 使用靜態 `HashSet<PostActionType>` 快取有效值
+- 避免 `Enum.IsDefined()` 的反射開銷
+- `HashSet.Contains()` 的時間複雜度為 O(1)
+- 靜態初始化，應用程式啟動時建立一次
+
+### 階段 2：修改 Command 層
+
+#### 2.1 更新 CreateAnnouncementBoardCommand
+**檔案**：`Announcement.Core/ApplicationServices/CreateAnnouncementBoardCommand.cs`
+
+```csharp
+public record CreateAnnouncementBoardCommand(
+    string SourceSite,
+    AnnouncementBoardType AnnouncementBoardType,
+    string Title,
+    string Content,
+    DateOnly PublishDate,
+    IReadOnlyList<AnnouncementBoardFileInputInfo> Files,
+    string UserId,
+    string UserName,
+    IReadOnlyList<PostActionType> PostActions);
+```
+
+#### 2.2 同步更新其他 Command
+- `UpdateAnnouncementBoardContentCommand`
+- `UpdateAnnouncementBoardFilesCommand`  
+- `DeleteAnnouncementBoardCommand`
+
+**實作重點**：
+- 使用 `IReadOnlyList<PostActionType>` 確保型別安全
+- 作為 record 類別的最後一個參數，保持向前相容性
+
+### 階段 3：修改 Event 層
+
+#### 3.1 更新 AnnouncementCreatedEvent
+**檔案**：`Announcement.Core/Events/AnnouncementCreatedEvent.cs`
+
+```csharp
+public record AnnouncementCreatedEvent(
+    string EventType,
+    DateTime Timestamp,
+    string SourceSite,
+    string BoardType,
+    Guid AnnouncementId,
+    string Title,
+    string Content,
+    DateOnly PublishDate,
+    IReadOnlyList<FileData> Files,
+    UserInfo CreateUser,
+    DateTime CreateDatetime,
+    IReadOnlyList<PostActionType> PostActions);
+```
+
+#### 3.2 同步更新其他 Event
+- `AnnouncementContentUpdatedEvent`
+- `AnnouncementFilesUpdatedEvent`
+- `AnnouncementDeletedEvent`
+
+### 階段 4：修改 ViewModel 層
+
+#### 4.1 更新 CreateAnnouncementBoardViewModel
+**檔案**：`Announcement.Web/ViewModels/CreateAnnouncementBoardViewModel.cs`
+
+```csharp
+using Announcement.Web.Validations;
+
+/// <summary>
+/// 事件後續處理動作類型清單
+/// </summary>
+[PostActionTypeValidation]
+public PostActionType[] PostActions { get; init; } = [];
+```
+
+#### 4.2 同步更新其他 ViewModel
+- `UpdateAnnouncementBoardContentViewModel`
+- `UpdateAnnouncementBoardFilesViewModel`
+
+#### 4.3 建立 DELETE API Query ViewModel
+**檔案**：`Announcement.Web/ViewModels/DeleteAnnouncementBoardQueryViewModel.cs`
+
+```csharp
+using Announcement.Core;
+using Announcement.Web.Validations;
+
+namespace Announcement.Web.ViewModels;
+
+/// <summary>
+/// 刪除公告 Query Parameter ViewModel
+/// </summary>
+public class DeleteAnnouncementBoardQueryViewModel
+{
+    /// <summary>
+    /// 事件後續處理動作類型清單
+    /// </summary>
+    [PostActionTypeValidation]
+    public PostActionType[] PostActions { get; init; } = [];
+}
+```
+
+**重要變更**：
+- 移除 `IValidatableObject.Validate` 中的手動驗證邏輯
+- 改用 `[PostActionTypeValidation]` 屬性進行自動驗證
+- 大幅簡化 ViewModel 程式碼
+
+**ViewModel 範例**：
+```csharp
+public class CreateAnnouncementBoardViewModel : IValidatableObject
+{
+    // ...existing properties...
+    
+    /// <summary>
+    /// 事件後續處理動作類型清單
+    /// </summary>
+    [PostActionTypeValidation]
+    public PostActionType[] PostActions { get; init; } = [];
+
+    public IEnumerable<ValidationResult> Validate(ValidationContext validationContext)
+    {
+        // 保留原有驗證邏輯，PostActions 驗證由屬性自動處理
+        // ...existing validation logic...
+    }
+}
+```
+
+### 階段 5：修改 Controller 層
+
+#### 5.1 更新 CreateAnnouncementBoard Action
+**檔案**：`Announcement.Web/Controllers/AnnouncementBoardController.cs`
+
+```csharp
+var command = new CreateAnnouncementBoardCommand(
+    sourceSite,
+    createViewModel.AnnouncementBoardType,
+    createViewModel.Title,
+    createViewModel.Content,
+    createViewModel.PublishDate,
+    fileInputInfoItems,
+    userId,
+    userName,
+    createViewModel.PostActions?.ToList() ?? new List<PostActionType>());
+```
+
+#### 5.2 DELETE API 統一驗證機制
+```csharp
+[HttpDelete("{announcementBoardType:announcementBoardTypeEnum}/{announcementId:guid}")]
+public async Task<IActionResult> DeleteAnnouncementBoardById(
+    [FromServices] ICommandService<DeleteAnnouncementBoardCommand> commandService,
+    [FromRoute] AnnouncementBoardType announcementBoardType,
+    [FromRoute] Guid announcementId,
+    [FromHeader(Name = "Source-Site")] string sourceSite,
+    [FromQuery] DeleteAnnouncementBoardQueryViewModel queryViewModel)
+{
+    // ModelState 自動驗證 PostActions，無需手動驗證
+    if (!ModelState.IsValid)
+    {
+        return BadRequest(ModelState);
+    }
+
+    var userId = HttpContext.User.GetUserId()!;
+    var userName = HttpContext.User.GetUserName()!;
+
+    var command = new DeleteAnnouncementBoardCommand(
+        sourceSite,
+        announcementBoardType,
+        announcementId,
+        userId,
+        userName,
+        queryViewModel.PostActions?.ToList() ?? new List<PostActionType>());
+
+    await commandService.ExecuteAsync(command, HttpContext.RequestAborted);
+    return Ok();
+}
+```
+
+**統一驗證機制優勢**：
+- **完全統一**：所有 API 都使用 `[PostActionTypeValidation]` 屬性
+- **自動驗證**：ASP.NET Core ModelState 自動處理驗證
+- **無重複程式碼**：DELETE API 不再需要手動驗證邏輯
+- **一致的錯誤格式**：所有驗證錯誤都遵循相同格式
+
+### 階段 6：修改 CommandService 層
+
+#### 6.1 更新事件發布邏輯
+在各 CommandService 的 `PublishEventAsync` 方法中：
+
+```csharp
+var eventData = new AnnouncementCreatedEvent(
+    "AnnouncementCreated",
+    DateTime.UtcNow,
+    command.SourceSite,
+    command.AnnouncementBoardType.ToString(),
+    announcementId,
+    command.Title,
+    command.Content,
+    command.PublishDate,
+    fileDataList,
+    new UserInfo(command.UserId, command.UserName),
+    DateTime.UtcNow,
+    command.PostActions);
+```
+
+## 🔧 技術實作細節
+
+### 驗證機制設計
+1. **完全統一驗證**：所有 API 都使用 `[PostActionTypeValidation]` 屬性進行自動驗證
+2. **效能優化**：使用靜態 `HashSet` 快取取代 `Enum.IsDefined()` 避免反射開銷
+3. **型別安全**：使用 enum 確保編譯時期的型別檢查
+4. **ViewModel 化**：DELETE API 的 Query Parameter 也使用 ViewModel 包裝
+
+**完全統一的驗證架構**：
+```csharp
+// 所有 ViewModel 都使用相同的驗證屬性
+[PostActionTypeValidation]
+public PostActionType[] PostActions { get; init; } = [];
+
+// 所有 Controller 都使用 ModelState 自動驗證
+if (!ModelState.IsValid) return BadRequest(ModelState);
+```
+
+**效能優化技術**：
+```csharp
+// 靜態快取避免反射開銷
+private static readonly HashSet<PostActionType> ValidActions = new(
+    Enum.GetValues<PostActionType>());
+
+// O(1) 時間複雜度的驗證
+if (!ValidActions.Contains(action)) { /* 錯誤處理 */ }
+```
+
+### DELETE API ViewModel 設計
+DELETE API 使用 Query Parameter ViewModel 實現統一驗證：
+
+```bash
+# 單一動作
+DELETE /boards/announcement/12345?postActions=Mail
+
+# 多個動作（預留未來使用）
+DELETE /boards/announcement/12345?postActions=Mail&postActions=Teams
+```
+
+**ViewModel 綁定優勢**：
+- 使用 `[FromQuery] DeleteAnnouncementBoardQueryViewModel` 自動綁定
+- 支援重複參數名稱的陣列解析
+- 自動驗證，無需手動檢查
+- 與其他 API 保持一致的驗證機制
+
+### JSON 序列化考量
+- PostActionType enum 會自動序列化為字串值
+- 確保 API 回應中顯示 `"Mail"` 而非數字 `1`
+- Consumer 可以直接處理字串值而無需額外轉換
+
+## ✅ 實作檢查清單
+
+### 程式碼修改
+- [ ] 建立 `PostActionType` enum 定義
+- [ ] 建立 `PostActionTypeValidationAttribute` 共用驗證屬性（效能優化版本）
+- [ ] 建立 `DeleteAnnouncementBoardQueryViewModel` 查詢 ViewModel
+- [ ] 更新 4 個 Command record 類別
+- [ ] 更新 4 個 Event record 類別  
+- [ ] 更新 4 個 ViewModel 類別並加入驗證屬性
+- [ ] 更新 Controller 的 4 個 Action 方法（統一使用 ModelState 驗證）
+- [ ] 更新 4 個 CommandService 的事件發布邏輯
+- [ ] 建立 PostActionTypeValidationAttribute 單元測試
+
+### 驗證測試
+- [ ] API 接受空的 PostActions 陣列，功能正常
+- [ ] API 接受 `["Mail"]` 陣列，事件正確包含此資訊
+- [ ] API 拒絕無效的動作類型，回傳適當錯誤訊息
+- [ ] DELETE API 正確處理 Query Parameter 格式
+- [ ] 事件訊息格式符合預期，Consumer 可正確解析
+
+### 相容性測試
+- [ ] 現有 API 呼叫（不含 PostActions）仍正常運作
+- [ ] Swagger 文件正確顯示新欄位
+- [ ] JSON 序列化/反序列化正常
+- [ ] 單元測試全數通過
+
+### 文件更新
+- [ ] API 文件更新，說明新欄位用法
+- [ ] Swagger 註解完整，包含範例值
+- [ ] README 或操作指南更新
+
+## 🚀 部署與監控
+
+### 部署策略
+1. **無停機部署**：純 API 層面變更，支援熱部署
+2. **向前相容**：新版 API 可與舊版 Consumer 共存
+3. **段階式驗證**：建議先部署至測試環境驗證完整功能
+
+### 監控指標
+- **API 錯誤率**：監控新欄位導致的驗證錯誤
+- **事件訊息大小**：確認 PostActions 欄位不會顯著增加訊息大小
+- **Consumer 處理狀況**：確認 Consumer 能正確處理新格式事件
+
+### 回滾計畫
+如發生問題可快速回滾至前一版本，因為：
+- 無資料庫結構變更
+- Consumer 可忽略未知欄位
+- API 向前相容性保證
+
+---
+
+**實作計畫產生日期**：2025-09-23  
+**對應任務**：Task 63079 - 訊息發送增加使用者動作選項 
+**風險等級**：低（最小修改範圍，向前相容）
